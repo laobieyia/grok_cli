@@ -2,10 +2,12 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
-use reqwest::{Request, Response, StatusCode};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio;
+mod error;
+use error::CliError;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -18,7 +20,7 @@ struct Cli {
 enum Commands {
     Ask {
         /// Query to send to Grok API
-        #[clap(short, long, value_parser)]
+        #[clap(short, long, value_parser, default_value = "default query")]
         query: String,
     },
 }
@@ -29,6 +31,19 @@ struct Messages {
     content: String,
 }
 
+struct Config {
+    api_key: String,
+    url: String,
+}
+impl Config {
+    fn from_env() -> Result<Self, CliError> {
+        dotenv().ok();
+        Ok(Self {
+            api_key: get_env_var("API_KEY")?,
+            url: get_env_var("GROK_URL")?,
+        })
+    }
+}
 #[derive(Debug, Serialize, Deserialize)]
 struct GrokRequest {
     url: String,
@@ -49,44 +64,38 @@ impl GrokRequest {
         }
     }
 }
+fn get_env_var(key: &str) -> Result<String, CliError> {
+    env::var(key).map_err(|_| CliError::MissingEnvVar(key.to_string()))
+}
 // 发送请求
-async fn send_request(request: &GrokRequest) -> Result<reqwest::Response, reqwest::Error> {
-    let client = reqwest::Client::new();
-    let res = client
+async fn send_request(
+    client: &reqwest::Client,
+    request: &GrokRequest,
+) -> Result<reqwest::Response, reqwest::Error> {
+    client
         .post(&request.url)
         .header("Authorization", format!("Bearer {}", request.api_key))
         .header("Content-Type", "application/json")
         .json(request)
         .send()
-        .await?;
-    Ok(res)
+        .await
 }
-async fn parse_response(res: reqwest::Response) -> Result<(), Box<dyn std::error::Error>> {
+async fn parse_response(res: reqwest::Response) -> Result<(), CliError> {
     let status = res.status();
     let text = res.text().await?;
 
-    println!("HTTP Status: {}", status);
-
-    if status == reqwest::StatusCode::OK {
-        let parsed_response: serde_json::Value = serde_json::from_str(&text)?;
-
-        if let Some(choices) = parsed_response["choices"].as_array() {
-            if let Some(first_choice) = choices.get(0) {
-                if let Some(content) = first_choice["message"]["content"].as_str() {
-                    println!("AI Response: {}", content);
-                } else {
-                    println!("No content found in the response.");
-                }
-            }
-        }
+    if status != StatusCode::OK {
+        return Err(CliError::HttpError(status, text));
+    }
+    let parsed_response: Value = serde_json::from_str(&text)?;
+    if let Some(content) = parsed_response["choices"]
+        .as_array()
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice["message"]["content"].as_str())
+    {
+        println!("AI Response: {}", content);
     } else {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Request failed with status: {} and message: {}",
-                status, text
-            ),
-        )));
+        println!("No content found in the response.")
     }
     Ok(())
 }
@@ -94,26 +103,22 @@ async fn parse_response(res: reqwest::Response) -> Result<(), Box<dyn std::error
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 读取 .env 文件
     dotenv().ok();
-    let api_key: String = env::var("API_KEY").expect("API_KEY must be set in .env");
-    let url = env::var("GROK_URL").expect("GROK_URL must be set in .env");
     let cli = Cli::parse();
-
+    let config = Config::from_env()?;
+    let client = reqwest::Client::new();
     match &cli.command {
         Some(Commands::Ask { query }) => {
-            let request = GrokRequest::from(url.clone(), api_key.clone(), query.clone());
-            let res = send_request(&request).await?;
+            let request = GrokRequest::from(config.url, config.api_key, query.clone());
+            let res = send_request(&client, &request).await?;
             parse_response(res).await?;
         }
         None => {
-            // 如果没有提供子命令，则直接执行默认行为（Ask）
-            println!("No command provided, please enter a query:");
             let request =
-                GrokRequest::from(url.clone(), api_key.clone(), "default query".to_string());
-            let res = send_request(&request).await?;
+                GrokRequest::from(config.url, config.api_key, "default query".to_string());
+            let res = send_request(&client, &request).await?;
             parse_response(res).await?;
         }
     }
 
     Ok(())
 }
-
